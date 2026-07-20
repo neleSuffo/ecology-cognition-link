@@ -1,0 +1,917 @@
+---
+title: "Link between Experiences and Cognition multioutput approach"
+format: html
+editor: visual
+---
+
+```{r libraries}
+library(tidyverse)
+library(catboost)
+library(caret)
+library(latex2exp)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(igraph)
+library(cowplot)
+library(gridExtra)
+library(scales)
+```
+
+```{r load_data}
+
+label_dict <- list(
+  # Demographics
+  "age_at_test" = "age",
+
+  # Global Ecology
+  "pct_Interacting"     = "P[int]",
+  "pct_Not_Interacting" = "P[paste('\u00AC', int)]",
+
+  # Vocal Activity
+  "kcs_per_overall"         = "KCS[all]",
+  "kcs_per_Interacting"     = "KCS[int]",
+  "kcs_per_Not_Interacting" = "KCS[paste('\u00AC',int)]",
+
+  # Speech Exposure (total)
+  "total_speech_exposure_per_overall"         = "Exps[all]",
+  "total_speech_exposure_per_Interacting"     = "Exps[int]",
+  "total_speech_exposure_per_Not_Interacting" = "Exps[paste('\u00AC', int)]",
+
+  # Child-directed speech
+  "kcds_exposure_per_overall"         = "KCDS[all]",
+  "kcds_exposure_per_Interacting"     = "KCDS[int]",
+  "kcds_exposure_per_Not_Interacting" = "KCDS[paste('\u00AC', int)]",
+
+  # Overheard speech
+  "ohs_exposure_per_overall"         = "OHS[all]",
+  "ohs_exposure_per_Interacting"     = "OHS[int]",
+  "ohs_exposure_per_Not_Interacting" = "OHS[paste('\u00AC', int)]",
+
+  # Turn-Taking
+  "turns_per_minute_overall"     = "TpM[all]",
+  "turns_per_minute_interacting" = "TpM[int]",
+  "agency_initiation_prop"       = "P[agency]",
+  "avg_turn_duration"            = "bar(D)[turn]",
+  "avg_block_duration"           = "bar(D)[block]",
+  "avg_turns_per_block"          = "bar(N)[paste(turn, '/', block)]",
+
+  # Visuals
+  "pct_face_visible"           = "P[face]",
+  "pct_person_visible"         = "P[person]",
+  "pct_face_or_person_visible" = "P[paste(face, '/', person)]",
+  "avg_face_proximity"         = "bar(d)[face]"
+)
+
+label_vec <- unlist(label_dict)
+
+# Load Data
+df <- read.csv("../data/final_feature_df.csv")
+
+df$orev_prop <- df$orev_successes / df$orev_trials 
+df$prag_prop <- df$prag_successes / df$prag_trials
+
+target_names <- c("orev_prop", "prag_prop")
+
+# STEP 2: Define columns to exclude from predictors (IVs)
+exclude_cols <- c(
+  "child_id", "sex", "age_at_recording", "min_age_rec",
+  "orev_successes", "prag_successes", "age_at_test",
+  "orev_trials", "prag_trials", "tango_trials", 
+  "tango_error", "orev_prop", "prag_prop"
+)
+
+# IVs are everything in the dataframe EXCEPT the excluded list 
+iv_list <- setdiff(names(df), exclude_cols)
+
+min_real_age <- round(min(df$age_at_test),2)
+max_real_age <- round(max(df$age_at_test), 2)
+
+# Load the comprehensive hyperparameter grid log to verify model metrics later
+orev_tuning_log <- read.csv("../outputs/orev_hyperparameter_tuning_log.csv")
+prag_tuning_log <- read.csv("../outputs/prag_hyperparameter_tuning_log.csv")
+
+# Load target sheets directly from local files
+orev_raw_shap <- read.csv("../outputs/orev_prop_final_oof_shap_values.csv") %>%
+  rename(child_id = child_idx, Feature = feature_raw, ActualValue = feature_value, 
+         DirectionalShap = shap_value, FeatureLabel = feature_paper_label) %>%
+  group_by(Feature) %>%
+  mutate(FeatureLevel = (ActualValue - min(ActualValue)) / (max(ActualValue) - min(ActualValue))) %>%
+  ungroup()
+
+prag_raw_shap <- read.csv("../outputs/prag_prop_final_oof_shap_values.csv") %>%
+  rename(child_id = child_idx, Feature = feature_raw, ActualValue = feature_value, 
+         DirectionalShap = shap_value, FeatureLabel = feature_paper_label) %>%
+  group_by(Feature) %>%
+  mutate(FeatureLevel = (ActualValue - min(ActualValue)) / (max(ActualValue) - min(ActualValue))) %>%
+  ungroup()
+```
+
+```{r remove_multicollinearity}
+# =====================================================================
+# STEP 4: SUBGRAPH MEDOID FEATURE SELECTION (Removes Multicollinearity)
+# =====================================================================
+cat("--- Starting Subgraph Medoid Feature Selection ---\n")
+
+# 1. Calculate Correlation Matrix on all initial IVs
+X_all_ivs <- df %>% select(all_of(iv_list))
+X_numeric <- X_all_ivs %>% select(where(is.numeric))
+cor_matrix_before <- cor(X_numeric, use = "pairwise.complete.obs", method = "pearson")
+
+# save correlation matrix 
+write.csv(cor_matrix_before, file = "../outputs/correlation_matrix_before.csv", row.names = TRUE)
+
+dist_matrix <- 1 - abs(cor_matrix_before)
+
+# 2. Create Adjacency Matrix (Threshold: absolute r >= 0.75 means distance <= 0.25)
+threshold <- 0.25
+adj_matrix <- ifelse(dist_matrix <= threshold, 1, 0)
+diag(adj_matrix) <- 0 # Remove self-loops
+
+# 3. Create Graph and find Maximal Cliques (Highly correlated groups)
+g <- igraph::graph_from_adjacency_matrix(adj_matrix, mode = "undirected")
+cliques <- igraph::max_cliques(g, min = 2)
+
+assigned_features <- c()
+selected_medoids <- c()
+
+# 4. Loop through groups and find the Medoid
+for (i in seq_along(cliques)) {
+  clique_features <- names(cliques[[i]])
+  unassigned_features <- setdiff(clique_features, assigned_features)
+  
+  if (length(unassigned_features) > 1) {
+    # Find the feature with the highest average correlation to others in this specific group
+    sub_cor <- abs(cor_matrix_before[unassigned_features, unassigned_features])
+    avg_cor <- colMeans(sub_cor)
+    medoid <- names(which.max(avg_cor))
+    
+    selected_medoids <- c(selected_medoids, medoid)
+    assigned_features <- c(assigned_features, unassigned_features)
+    
+    cat(sprintf("\nGroup %d found:\n  Features: %s\n  -> Selected Captain (Medoid): %s\n", 
+                i, paste(unassigned_features, collapse = ", "), medoid))
+  }
+}
+
+# 5. Keep independent features + selected medoids
+independent_features <- setdiff(iv_list, assigned_features)
+iv_list_clean <- c("age_at_test",independent_features, selected_medoids)
+
+cat(sprintf("\nReduced feature set from %d to %d (Preserving SHAP interpretability!)\n", 
+            length(iv_list), length(iv_list_clean)))
+cat("--------------------------------------------------\n")
+
+# 6. Update iv_list and X to only include the surviving features
+iv_list <- iv_list_clean
+X <- df %>% select(all_of(iv_list))
+# =====================================================================
+
+# 7. Prepare targets
+Y <- df %>% select(orev_prop, prag_prop)
+
+# 8. Ensure data is clean (Remove NAs from targets)
+clean_indices <- which(complete.cases(df[, target_names]))
+df_clean <- df[clean_indices, ]
+X_clean <- X[clean_indices, , drop = FALSE]
+Y_clean <- Y[clean_indices, , drop = FALSE]
+child_ids_clean <- df$child_id[clean_indices]
+```
+
+```{r visualize_correlation_matrix}
+# 1. Compute Matrix After Selection
+X_after <- X_clean %>% select(where(is.numeric))
+names(X_after)
+cor_matrix_after <- cor(X_after, use = "pairwise.complete.obs")
+
+# 2. Upgraded Plotting Function
+# Upgraded Plotting Function showing only significance stars
+# Clean Plotting Function (Colors only, no text/stars)
+plot_cor <- function(m, title) {
+  # Get the original variable ordering from the matrix rows/columns
+  var_order <- colnames(m)
+  
+  # Hide the upper triangle AND the diagonal
+  m[upper.tri(m, diag = TRUE)] <- NA
+  
+  # Convert matrix to a long data frame
+  df_plot <- as.data.frame(as.table(m))
+  names(df_plot) <- c("V1", "V2", "r")
+  
+  # Remove empty rows
+  df_plot <- subset(df_plot, !is.na(r))
+  
+  # Trim the factor levels so empty outer rows/columns disappear
+  x_levels <- var_order[-1]
+  y_levels <- var_order[-length(var_order)]
+  
+  df_plot$V1 <- factor(df_plot$V1, levels = x_levels)
+  df_plot$V2 <- factor(df_plot$V2, levels = y_levels)
+  
+  # Filter out any lingering outside data
+  df_plot <- subset(df_plot, !is.na(V1) & !is.na(V2))
+  
+  # HELPER FUNCTION: Looks up the plotmath string and parses it into an expression
+  label_parser <- function(breaks) {
+    mapped_strings <- ifelse(breaks %in% names(label_vec), label_vec[breaks], breaks)
+    parse(text = mapped_strings)
+  }
+  
+  ggplot(df_plot, aes(x = V1, y = V2, fill = r)) +
+    geom_tile(color = "white", size = 0.4) + 
+    
+    # FORCE A PERFECT 1:1 SQUARE ASPECT RATIO
+    coord_fixed() + 
+    
+    scale_fill_gradient2(low = "#0571b0", high = "#ca0020", mid = "#f7f7f7", 
+                         limit = c(-1,1), breaks = c(-1, -0.5, 0, 0.5, 1.0)) +
+    
+    theme_minimal() +
+    labs(title = title, x = "", y = "") + 
+    
+    theme(
+      axis.text.x = element_text(size = 24, angle = 90, hjust = 1, vjust = 0.5, color = "black"),
+      axis.text.y = element_text(size = 24, color = "black"),
+      panel.grid = element_blank(), 
+      
+      # REMOVE ALL INTERNAL MARGIN PADDING
+      plot.margin = margin(0, 0, 0, 0, "pt"),
+      
+      legend.position = c(0.15, 0.75), 
+      legend.direction = "vertical",
+      legend.background = element_blank(),
+      legend.title = element_blank(), 
+      legend.text = element_text(size = 20),
+      legend.key.height = unit(1.5, "cm"),
+      legend.key.width = unit(1, "cm")
+    ) +
+    
+    scale_x_discrete(labels = label_parser, drop = TRUE) +
+    scale_y_discrete(labels = label_parser, drop = TRUE)
+}
+
+# 3. Display Side-by-Side
+plot_before <- plot_cor(cor_matrix_before, "Correlation matrix before feature selection")
+plot_after <- plot_cor(cor_matrix_after, "")
+
+# 5. Save them directly to your computer
+ggsave("../outputs/correlation_matrix_before.png", plot = plot_before, width = 8, height = 8, dpi = 600, scale=0.8)
+ggsave("../outputs/correlation_matrix_after.png", plot = plot_after, width = 12, height = 12, dpi = 600, scale=0.7)
+saveRDS(plot_after, "../outputs/correlation_matrix_after.rds")
+```
+
+```{r evaluate_model_separated, message=FALSE, warning=FALSE}
+# =====================================================================
+# STEP 5: TARGET-SEPARATED BOOTSTRAP METRIC CRUNCHER
+# =====================================================================
+# 2. Extract baseline training metric constants from winning configurations
+orev_train_r2   <-0.3311
+orev_train_rmse <- 0.1202
+orev_train_mae <- 0.0982
+
+prag_train_r2   <- 0.8549
+prag_train_rmse <- 0.0573
+prag_train_mae <- 0.0330
+
+# 2. Extract a clean, deduplicated vector of actual vs predicted values per child
+# Since the SHAP file repeats child entries for every feature, we grab just 1 feature row per child
+extract_clean_predictions <- function(shap_dataframe) {
+  shap_dataframe %>%
+    filter(Feature == "age_at_test") %>% # Keeps exactly 1 row per child_id
+    select(child_id, actual_value, predicted_value) %>%
+    distinct(child_id, .keep_all = TRUE)
+}
+
+orev_predictions_df <- extract_clean_predictions(orev_raw_shap)
+prag_predictions_df <- extract_clean_predictions(prag_raw_shap)
+
+# 3. Core function to calculate standard performance indices per sample group
+calculate_base_metrics <- function(actual, pred) {
+  rmse_val <- sqrt(mean((actual - pred)^2, na.rm = TRUE))
+  mae_val  <- mean(abs(actual - pred), na.rm = TRUE)
+  
+  mean_act <- mean(actual, na.rm = TRUE)
+  r2_val   <- 1 - (sum((actual - pred)^2, na.rm = TRUE) / sum((actual - mean_act)^2, na.rm = TRUE))
+  
+  # Suppress warnings in case constant vectors occur during resampling iterations
+  spearman_val <- suppressWarnings(cor(actual, pred, method = "spearman"))
+  
+  return(c(R2 = r2_val, MAE = mae_val, RMSE = rmse_val, Spearman = spearman_val))
+}
+
+# 4. Engine to execute non-parametric bootstrapping with true child-id resampling
+bootstrap_target_metrics <- function(predictions_df, iterations = 2000) {
+  set.seed(123) # Guarantee reproducibility for manuscript writing
+  n_samples <- nrow(predictions_df)
+  
+  # Compute true original empirical values
+  empirical <- calculate_base_metrics(predictions_df$actual_value, predictions_df$predicted_value)
+  
+  # Run bootstrap loops
+  boot_matrix <- matrix(NA, nrow = iterations, ncol = 4)
+  colnames(boot_matrix) <- c("R2", "MAE", "RMSE", "Spearman")
+  
+  for (b in 1:iterations) {
+    sampled_indices <- sample(1:n_samples, n_samples, replace = TRUE)
+    boot_sample     <- predictions_df[sampled_indices, ]
+    
+    boot_matrix[b, ] <- calculate_base_metrics(
+      boot_sample$actual_value, 
+      boot_sample$predicted_value
+    )
+  }
+  
+  # Extract exact 2.5th and 97.5th percentiles for the 95% Confidence Intervals
+  ci_lower <- apply(boot_matrix, 2, function(x) quantile(x, 0.025, na.rm = TRUE))
+  ci_upper <- apply(boot_matrix, 2, function(x) quantile(x, 0.975, na.rm = TRUE))
+  
+  # Consolidate into a clean flat list object for inline R Markdown use
+  result_list <- list(
+    R2             = empirical["R2"],
+    R2_lower       = ci_lower["R2"],
+    R2_upper       = ci_upper["R2"],
+    
+    MAE            = empirical["MAE"],
+    MAE_lower      = ci_lower["MAE"],
+    MAE_upper      = ci_upper["MAE"],
+    
+    RMSE           = empirical["RMSE"],
+    RMSE_lower     = ci_lower["RMSE"],
+    RMSE_upper     = ci_upper["RMSE"],
+    
+    Spearman       = empirical["Spearman"],
+    Spearman_lower = ci_lower["Spearman"],
+    Spearman_upper = ci_upper["Spearman"]
+  )
+  
+  return(result_list)
+}
+
+# 5. Run evaluation loops independently for both targets using the extracted tables
+orev_metrics <- bootstrap_target_metrics(orev_predictions_df, iterations = 2000)
+prag_metrics <- bootstrap_target_metrics(prag_predictions_df, iterations = 2000)
+
+# Append internal training constants directly onto objects for inline formatting
+orev_metrics$Train_R2   <- orev_train_r2
+orev_metrics$Train_RMSE <- orev_train_rmse
+orev_metrics$Train_MAE <- orev_train_mae
+prag_metrics$Train_R2   <- prag_train_r2
+prag_metrics$Train_RMSE <- prag_train_rmse
+prag_metrics$Train_MAE <- prag_train_mae
+
+# 7. Save standalone consolidated csv metrics sheets to your machine
+metric_summary_table <- data.frame(
+  Domain          = c("OREV_Vocabulary", "PRAG_Pragmatics"),
+  
+  # Out-of-Fold Test R2 Bounds
+  OOF_R2          = c(orev_metrics$R2, prag_metrics$R2),
+  OOF_R2_Lower    = c(orev_metrics$R2_lower, prag_metrics$R2_lower),
+  OOF_R2_Upper    = c(orev_metrics$R2_upper, prag_metrics$R2_upper),
+  
+  # Out-of-Fold Test MAE Bounds
+  OOF_MAE         = c(orev_metrics$MAE, prag_metrics$MAE),
+  OOF_MAE_Lower   = c(orev_metrics$MAE_lower, prag_metrics$MAE_lower),
+  OOF_MAE_Upper   = c(orev_metrics$MAE_upper, prag_metrics$MAE_upper),
+  
+  # Out-of-Fold Test RMSE Bounds
+  OOF_RMSE        = c(orev_metrics$RMSE, prag_metrics$RMSE),
+  OOF_RMSE_Lower  = c(orev_metrics$RMSE_lower, prag_metrics$RMSE_lower),
+  OOF_RMSE_Upper  = c(orev_metrics$RMSE_upper, prag_metrics$RMSE_upper),
+  
+  # Out-of-Fold Spearman Rank Tracking Bounds
+  Spearman_Rho    = c(orev_metrics$Spearman, prag_metrics$Spearman),
+  Spearman_Lower  = c(orev_metrics$Spearman_lower, prag_metrics$Spearman_lower),
+  Spearman_Upper  = c(orev_metrics$Spearman_upper, prag_metrics$Spearman_upper),
+  
+  # Internal Baseline Training Context (Overfitting Check)
+  Train_R2        = c(orev_metrics$Train_R2, prag_metrics$Train_R2),
+  Train_RMSE      = c(orev_metrics$Train_RMSE, prag_metrics$Train_RMSE),
+  Train_MAE       = c(orev_metrics$Train_MAE, prag_metrics$Train_MAE)
+)
+
+write.csv(metric_summary_table, "../outputs/catboost_performance_metrics.csv", row.names = FALSE)
+```
+
+```{r global_absolute_shap_importance}
+# Function to isolate domain and render standard global bar graph
+plot_global_shap <- function(shap_df) {
+  importance_df <- shap_df %>%
+    group_by(Feature, FeatureLabel) %>%
+    summarise(Importance = mean(abs(DirectionalShap)), .groups = "drop") %>%
+    arrange(desc(Importance))
+  
+  ggplot(importance_df, aes(x = reorder(FeatureLabel, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = rgb(128/255, 134/255, 123/255)) +
+    coord_flip() +
+    scale_x_discrete(labels = function(x) parse(text = x)) +
+    labs(title = NULL, x = "Predictors", y = expression(bar(abs(SHAP)))) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 40),
+      axis.title.x = element_text(size = 24),
+      axis.title.y = element_text(size = 24),
+      axis.text.x  = element_text(size = 20),
+      axis.text.y  = element_text(size = 20),
+      panel.grid.major.y = element_blank()
+    )
+}
+
+# Generate and save separate bar charts
+orev_absolute_shap <- plot_global_shap(orev_raw_shap)
+prag_absolute_shap <- plot_global_shap(prag_raw_shap)
+
+ggsave("../outputs/orev_mean_shap_importance.png", plot = orev_bar, width = 10, height = 8, dpi = 1200) #scale = 0.8)
+ggsave("../outputs/prag_mean_shap_importance.png", plot = prag_bar, width = 10, height = 8, dpi = 1200) #scale = 0.8)
+```
+
+```{r directional_shap_plot}
+# =====================================================================
+# PLOT 3 & 4: SEPARATE DIRECTIONAL BEESWARM CHARTS
+# =====================================================================
+plot_directional_beeswarm_augmented <- function(shap_df, 
+                                              threshold = 0.013, 
+                                              edge_max_L = 0.060, 
+                                              edge_max_R = 0.080, 
+                                              buffer = 0.005) {
+  # =====================================================================
+  # 1. MATHEMATICAL PROJECTIONS USING INSTANCE-SPECIFIC PARAMETERS
+  # =====================================================================
+  plot_df <- shap_df %>%
+    group_by(Feature) %>%
+    filter(max(abs(DirectionalShap)) > 0.0001) %>%
+    ungroup() %>%
+    mutate(
+      PlotX = case_when(
+        # Far Left: Project points from -threshold down to -edge_max_L
+        DirectionalShap < -threshold ~ -threshold - buffer * (abs(DirectionalShap) - threshold) / (edge_max_L - threshold),
+        # Far Right: Project points from +threshold up to +edge_max_R
+        DirectionalShap > threshold  ~ threshold + buffer * (DirectionalShap - threshold) / (edge_max_R - threshold),
+        # Central area stays perfectly linear
+        TRUE ~ DirectionalShap
+      )
+    )
+
+  # Determine dynamic positions for the white background mask boxes
+  mask_left_min  <- -threshold - 0.0005
+  mask_left_max  <- -threshold + 0.0005
+  mask_right_min <- threshold - 0.0005
+  mask_right_max <- threshold + 0.0005
+
+  # =====================================================================
+  # 2. GENERATE GRAPHIC WITH DYNAMIC ANNOTATIONS
+  # =====================================================================
+  ggplot(plot_df, aes(x = PlotX, y = reorder(FeatureLabel, abs(DirectionalShap)))) +
+    geom_vline(xintercept = 0, color = "darkgray", linetype = "dashed") +
+    geom_jitter(aes(color = FeatureLevel), height = 0.2, width = 0, alpha = 0.7, size = 1.8) +
+    
+    # Dynamic Opaque Mask Boxes to clear background grid channels at the threshold split points
+    geom_rect(xmin = mask_left_min, xmax = mask_left_max, ymin = 0.4, ymax = 13.6, fill = "white", color = NA) +
+    geom_rect(xmin = mask_right_min, xmax = mask_right_max, ymin = 0.4, ymax = 13.6, fill = "white", color = NA) +
+    
+    # Parallel Break Bars (Centered dynamically at ±threshold)
+    annotate("segment", x = -threshold - 0.0004, xend = -threshold, y = 0.4, yend = 13.6, color = "darkgray", linewidth = 0.6) +
+    annotate("segment", x = -threshold, xend = -threshold + 0.0004, y = 0.4, yend = 13.6, color = "darkgray", linewidth = 0.6) +
+    annotate("segment", x = threshold - 0.0004, xend = threshold, y = 0.4, yend = 13.6, color = "darkgray", linewidth = 0.6) +
+    annotate("segment", x = threshold, xend = threshold + 0.0004, y = 0.4, yend = 13.6, color = "darkgray", linewidth = 0.6) +
+    
+    # -----------------------------------------------------------------
+    # SPECIFY BREAKS AND LABELS
+    # -----------------------------------------------------------------
+    scale_x_continuous(
+      breaks = c(
+        -threshold - 0.005,  # Left Tail Window Tick
+        -threshold,          # Central Linear Boundary Left
+        0,                   # Center
+        threshold,           # Central Linear Boundary Right
+        threshold + 0.005    # Right Tail Window Tick
+      ),
+      labels = c(
+        sprintf("-%.3f", edge_max_L),
+        sprintf("-%.3f", threshold),
+        "0.000",
+        sprintf("%.3f", threshold),
+        sprintf("%.3f", edge_max_R)
+      )
+    ) +
+    scale_color_gradientn(
+      colors = c("#4c72b0", "#c44e52"),
+      breaks = c(0.05, 0.95),
+      labels = c("Low", "High"),
+      limits = c(0, 1)
+    ) +
+    labs(
+      title = NULL, 
+      x = paste0("Directional SHAP Value (Axis Breaks at ±", sprintf("%.3f", threshold), ")"), 
+      y = "Predictors", 
+      color = "Predictor\nValue"
+    ) +
+    theme_minimal() +
+    scale_y_discrete(labels = function(x) parse(text = x)) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 40),
+      axis.text.x = element_text(size = 20),
+      axis.text.y = element_text(size = 20),
+      axis.title.x  = element_text(size = 24),
+      axis.title.y = element_text(size = 24),
+      panel.grid.minor = element_blank(),
+      legend.position = c(0.9, 0.23),
+      legend.background = element_rect(fill = "white", color = "lightgray", linewidth = 0.3),
+      legend.title = element_text(size = 16, face = "bold", margin = margin(b = 6)),
+      legend.text = element_text(size = 16),
+      legend.ticks = element_blank(),
+      legend.key = element_blank()
+    ) +
+    guides(color = guide_colorbar(title.hjust = 0.5, barheight = unit(3.5, "cm"), barwidth = unit(0.25, "cm")))
+}
+
+plot_directional_beeswarm <- function(shap_df) {
+  
+  # 1. Define your exact list of social predictors (excluding age and visuals)
+  social_features <- c(
+    #"age_at_test", 
+    "kcs_per_overall","kcs_per_Interacting",                      
+    "total_speech_exposure_per_Interacting", "total_speech_exposure_per_Not_Interacting", "kcds_exposure_per_Interacting",
+    "kcds_exposure_per_Not_Interacting", "ohs_exposure_per_Interacting", "turns_per_minute_interacting",
+    "agency_initiation_prop", "avg_turn_duration", "pct_face_or_person_visible", "pct_Not_Interacting")
+  
+  # 2. Filter data frame for social features only, and ensure it contains active variances
+  plot_df <- shap_df %>%
+    #filter(Feature %in% social_features) %>%
+    group_by(Feature) %>%
+    filter(max(abs(DirectionalShap)) > 0.0001) %>%
+    ungroup()
+
+  # 3. Generate the un-broken, linear visualization
+  ggplot(plot_df, aes(x = DirectionalShap, y = reorder(FeatureLabel, abs(DirectionalShap)))) +
+    # Reference baseline at exactly zero impact
+    geom_vline(xintercept = 0, color = "darkgray", linetype = "dashed") +
+    
+    # Raw individual observations mapped with subtle horizontal jittering
+    geom_jitter(aes(color = FeatureLevel), height = 0.2, width = 0, alpha = 0.7, size = 1.8) +
+    
+    # Let R dynamically generate clean, linear breaks across the actual SHAP ranges
+    scale_x_continuous(labels = scales::label_number(accuracy = 0.001)) +
+    
+    # Unified color ramp (Low = Blue, High = Red)
+    scale_color_gradientn(
+      colors = c("#4c72b0", "#c44e52"), 
+      breaks = c(0.05, 0.95),
+      labels = c("Low", "High"), 
+      limits = c(0, 1)
+    ) +
+    
+    # Structured title configurations
+    labs(
+      title = NULL, 
+      x = "Directional SHAP Value", 
+      y = "Predictors", 
+      color = "Predictor\nValue"
+    ) +
+    
+    theme_minimal() +
+    
+    # Safely parses your custom plotmath/latex math strings on the Y-axis
+    scale_y_discrete(labels = function(x) parse(text = x)) +
+    
+    theme(
+      axis.text.x = element_text(size = 20),
+      axis.text.y = element_text(size = 20),
+      axis.title  = element_text(size = 24),
+      panel.grid.minor = element_blank(),
+      
+      # Clean legend box formatting placement
+      legend.position = c(0.9, 0.23),
+      legend.background = element_rect(fill = "white", color = "lightgray", linewidth = 0.3),
+      legend.title = element_text(size = 16, face = "bold", margin = margin(b = 6)),
+      legend.text = element_text(size = 16),
+      legend.ticks = element_blank(),
+      legend.key = element_blank()
+    ) +
+    
+    guides(
+      color = guide_colorbar(
+        title.hjust = 0.5, 
+        barheight = unit(3.5, "cm"), 
+        barwidth = unit(0.25, "cm")
+      )
+    )
+}
+
+orev_beeswarm <- plot_directional_beeswarm(orev_raw_shap)
+prag_beeswarm <- plot_directional_beeswarm(prag_raw_shap)
+
+# Render separate beeswarm graphs
+orev_aug_beeswarm <- plot_directional_beeswarm_augmented(
+  shap_df     = orev_raw_shap, 
+  threshold   = 0.013, 
+  edge_max_L  = 0.05, 
+  edge_max_R  = 0.05
+)
+
+prag_aug_beeswarm <- plot_directional_beeswarm_augmented(
+  shap_df     = prag_raw_shap, 
+  threshold   = 0.05,   # Higher threshold to allow a wider middle linear zone
+  edge_max_L  = 0.01,   # Adjusted left axis limit
+  edge_max_R  = 0.01    # Adjusted right axis limit
+)
+
+ggsave("../outputs/orev_directional_shap_importance.png", plot = orev_beeswarm, width = 16, height = 8, dpi = 1200) #scale = 0.8)
+ggsave("../outputs/prag_directional_shap_importance.png", plot = prag_beeswarm, width = 16, height = 8, dpi = 1200) #scale = 0.8)
+```
+
+```{r dependence_shap_plot}
+# =====================================================================
+# PLOTS 5-8: SEPARATE VISUAL CAPABILITY PLOT HOOKS (FLAT & INTERACTION)
+# =====================================================================
+
+# 1. UPGRADED UNIVERSAL SUB-PLOT RENDERING ENGINE
+create_dependence_plot <- function(df, target_feature, color_feature = NULL, display_name, remove_y_axis = FALSE, remove_y_title = FALSE, y_limits = NULL) {
+  feature_data <- df %>% filter(Feature == target_feature)
+  
+  clean_proportion_labels <- function(x) {
+    labels <- sprintf("%.2f", x)
+    labels[x == 0] <- "0"
+    labels[x == 1] <- "1"
+    return(labels)
+  }
+  
+  # Map custom math expressions securely
+  x_axis_expression <- switch(
+    target_feature,
+    "kcds_exposure_per_Interacting" = latex2exp::TeX("$KCDS_{int}$"),
+    "ohs_exposure_per_Interacting"  = latex2exp::TeX("$OHS_{int}$"),
+    "pct_face_or_person_visible"    = latex2exp::TeX("$P_{face/person}$"),
+    "turns_per_minute_interacting"  = latex2exp::TeX("$TpM_{int}$"),
+    "total_speech_exposure_per_Interacting" = latex2exp::TeX("$Exps_{int}$"), 
+    latex2exp::TeX(paste(display_name))
+  )
+  
+  percentage_features <- c(
+    "kcds_exposure_per_Interacting", 
+    "ohs_exposure_per_Interacting", 
+    "pct_face_or_person_visible", 
+    "total_speech_exposure_per_Interacting"
+  )
+  
+  p <- ggplot(feature_data, aes(x = ActualValue, y = DirectionalShap))
+  
+  p <- p + 
+    geom_hline(yintercept = 0, color = "darkgray", linetype = "dashed") +
+    geom_smooth(method = "gam", color = "black", linetype = "solid", size = 1.0, se = FALSE)
+  
+  if (!is.null(color_feature)) {
+    p <- p + 
+      geom_point(aes(color = !!sym(color_feature)), alpha = 0.7, size = 2.2) +
+      scale_color_gradientn(colors = c("#4c72b0", "#c44e52")) +
+      labs(color = "Age \n(Years)")
+  } else {
+    p <- p + 
+      geom_point(color = rgb(128/255, 134/255, 123/255), alpha = 0.6, size = 2.2)
+  }
+  
+  if (target_feature %in% percentage_features) {
+    p <- p + scale_x_continuous(labels = scales::percent_format(accuracy = 1))
+  } else {
+    p <- p + scale_x_continuous()
+  }
+  
+  p <- p +
+    labs(title = NULL, x = x_axis_expression, y = "Directional \n SHAP Value") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(size = 20),
+      axis.text.y = element_text(size = 20),
+      axis.title  = element_text(size = 24),
+      panel.grid.minor = element_blank(),
+      legend.ticks = element_blank(),
+      legend.title = element_text(size = 16, face = "bold", margin = margin(b = 6)),
+      legend.text  = element_text(size = 16)
+    )
+  
+  if (!is.null(y_limits)) { p <- p + scale_y_continuous(limits = y_limits) }
+  
+  # New condition: removes ONLY the label text, leaves numbers and ticks
+  if (remove_y_title) {
+    p <- p + theme(axis.title.y = element_blank())
+  }
+  
+  # Original condition: removes everything on the y-axis
+  if (remove_y_axis) {
+    p <- p + theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  }
+  
+  return(p)
+}
+
+
+create_flat_age_plot <- function(df, y_limits = NULL) {
+  age_data <- df %>% filter(Feature == "age_at_test")
+  
+  p <- ggplot(age_data, aes(x = ActualValue, y = DirectionalShap)) +
+    geom_hline(yintercept = 0, color = "darkgray", linetype = "dashed") +
+    geom_point(color = rgb(128/255, 134/255, 123/255), alpha = 0.6, size = 2.2) +
+    geom_smooth(method = "gam", color = "black", linetype = "solid", size = 1.0, se = FALSE)
+  
+  # Apply limits directly within scale definition to avoid conflicts
+  if (!is.null(y_limits)) { 
+    p <- p + scale_y_continuous(limits = y_limits) 
+  } else {
+    p <- p + scale_y_continuous()
+  }
+  
+  p <- p +
+    labs(title = NULL, x = "Age (Years)", y = "Directional \n SHAP Value") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(size = 20),
+      axis.text.y = element_text(size = 20),
+      axis.title  = element_text(size = 24),
+      panel.grid.minor = element_blank()
+    )
+  
+  return(p)
+}
+
+# 2. HELPER PIPELINE TO EXTRACT AGE MATRIX MAPPINGS
+prepare_interaction_df <- function(target_shap_df) {
+  
+  # 1. Isolate the TRUE unscaled chronological age for each child (ActualValue)
+  age_mapping <- target_shap_df %>%
+    filter(Feature == "age_at_test") %>%
+    select(child_id, AgeValue = ActualValue) %>% # FIXED: Tracks real years, not 0-1 scale
+    distinct(child_id, .keep_all = TRUE)
+  
+  # 2. Join it back and clean out the duplicate columns to avoid confusion
+  cleaned_df <- target_shap_df %>%
+    left_join(age_mapping, by = "child_id") %>%
+    select(
+      child_id, target, Feature, FeatureLevel, 
+      ActualValue, DirectionalShap, AgeValue,
+      baseline_value, predicted_value
+    )
+  
+  return(cleaned_df)
+}
+
+orev_interaction_df <- prepare_interaction_df(orev_raw_shap)
+prag_interaction_df <- prepare_interaction_df(prag_raw_shap)
+
+# =====================================================================
+# 3. COMPILE OREV FIGURES (TOP TWO SOCIAL PREDICTORS)
+# =====================================================================
+shared_bounds_orev <- c(-0.015, 0.015)
+
+orev_age_bounds <- c(-0.06, 0.06)
+prag_age_bounds <- c(-0.12, 0.12)
+orev_age_flat_plot <- create_flat_age_plot(orev_interaction_df)
+orev_age_flat_plot  <- create_flat_age_plot(orev_interaction_df, y_limits = orev_age_bounds)
+prag_age_flat_plot  <- create_flat_age_plot(prag_interaction_df, y_limits = prag_age_bounds)
+
+# Variation 1: Standard Flat Layout (No age colors)
+orev_flat_1 <- create_dependence_plot(orev_interaction_df, "ohs_exposure_per_Interacting", color_feature = NULL, "OHS_int", remove_y_axis = TRUE, y_limits = shared_bounds_orev)
+orev_flat_2 <- create_dependence_plot(orev_interaction_df, "pct_face_or_person_visible", color_feature = NULL, "P_face/person", remove_y_axis = TRUE, y_limits = shared_bounds_orev)
+orev_flat_3 <- create_dependence_plot(orev_interaction_df, "kcds_exposure_per_Interacting", color_feature = NULL, "KCDS_int", remove_y_axis = TRUE, y_limits = shared_bounds_orev)
+
+orev_int_1 <- create_dependence_plot(orev_interaction_df, "ohs_exposure_per_Interacting", color_feature = "AgeValue", "OHS_int", remove_y_axis = FALSE, remove_y_title = TRUE, y_limits = shared_bounds_orev) + theme(legend.position = "none")
+orev_int_2 <- create_dependence_plot(orev_interaction_df, "pct_face_or_person_visible", color_feature = "AgeValue", "P_face/person", remove_y_axis = TRUE, y_limits = shared_bounds_orev) + theme(legend.position = "none")
+orev_int_3 <- create_dependence_plot(orev_interaction_df, "kcds_exposure_per_Interacting", color_feature = "AgeValue", "KCDS_int", remove_y_axis = TRUE, y_limits = shared_bounds_orev)
+
+# =====================================================================
+# 4. COMPILE PRAG FIGURES (TOP TWO SOCIAL PREDICTORS)
+# =====================================================================
+shared_bounds_prag <- c(-0.04, 0.04)
+
+# Variation 1: Standard Flat Layout (No age colors)
+prag_flat_1 <- create_dependence_plot(prag_interaction_df, "kcds_exposure_per_Interacting", color_feature = NULL, "KCDS_int", remove_y_axis = FALSE, y_limits = shared_bounds_prag)
+prag_flat_2 <- create_dependence_plot(prag_interaction_df, "turns_per_minute_interacting", color_feature = NULL, "TpM_int", remove_y_axis = TRUE, y_limits = shared_bounds_prag)
+prag_flat_3 <- create_dependence_plot(prag_interaction_df, "total_speech_exposure_per_Interacting", color_feature = NULL, "Exps_int", remove_y_axis = TRUE, y_limits = shared_bounds_prag)
+
+prag_int_1 <- create_dependence_plot(prag_interaction_df, "kcds_exposure_per_Interacting", color_feature = "AgeValue", "KCDS_int", remove_y_axis = FALSE, remove_y_title = TRUE, y_limits = shared_bounds_prag) + theme(legend.position = "none")
+prag_int_2 <- create_dependence_plot(prag_interaction_df, "turns_per_minute_interacting", color_feature = "AgeValue", "TpM_int", remove_y_axis = TRUE, y_limits = shared_bounds_prag) + theme(legend.position = "none")
+prag_int_3 <- create_dependence_plot(prag_interaction_df, "total_speech_exposure_per_Interacting", color_feature = "AgeValue", "Exps_int", remove_y_axis = TRUE, y_limits = shared_bounds_prag)
+
+prag_int_3 <- create_dependence_plot(prag_interaction_df, 
+  "total_speech_exposure_per_Interacting", color_feature = "AgeValue", "Exps_int", 
+  remove_y_axis = TRUE, y_limits = shared_bounds_prag) + 
+  # Overwrite the continuous x-axis breaks to step by 0.20
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 1, by = 0.20)
+  )
+```
+
+```{r generate_combined_plot_orev}
+master_theme <- theme_minimal(base_size = 24) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 40),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 20),
+    axis.text.y = element_text(size = 20),
+    axis.title.y = element_text(size = 24, margin = margin(t = 10)),
+    axis.title.x = element_text(size = 24, margin = margin(t = 10)),
+    strip.text = element_blank(),
+    strip.background = element_blank(),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    panel.border = element_blank()
+  )
+
+orev_absolute_shap_plot <- orev_absolute_shap + master_theme
+
+orev_top_row <- plot_grid(
+  orev_absolute_shap_plot,
+  orev_age_flat_plot,
+  ncol = 2, 
+  labels = c("A", "B"), 
+  label_fontface = "bold",
+  rel_widths = c(1.5, 1))
+
+orev_middle_row <- plot_grid(
+  orev_aug_beeswarm_plot,
+  ncol = 1,
+  labels = c("C"), 
+  label_fontface = "bold")
+
+orev_bottom_row <- plot_grid(
+  orev_int_1,
+  orev_int_2,
+  orev_int_3,
+  ncol = 3,
+  labels = c("C", "D", "E"), 
+  label_fontface = "bold",
+  align = "h",
+  rel_widths = c(1, 0.75, 0.85))
+
+orev_combined <- plot_grid(
+  orev_top_row,
+  #orev_middle_row,
+  orev_bottom_row,
+  ncol = 1,
+  rel_heights = c(1, 1)) # Allocation: 20% top, 40% middle, 40% bottom
+  #rel_heights = c(1.1, 1.1, 0.7)) # Allocation: 20% top, 40% middle, 40% bottom
+
+ggsave("../outputs/orev_shap_combined.png", plot = orev_combined, width = 18, height = 12, dpi = 600, scale = 0.8)
+```
+
+```{r generate_combined_plot_prag}
+prag_absolute_shap_plot <- prag_absolute_shap + master_theme
+
+prag_top_row <- plot_grid(
+  prag_absolute_shap_plot,
+  prag_age_flat_plot,
+  ncol = 2, 
+  labels = c("F", "G"), 
+  label_fontface = "bold",
+  rel_widths = c(1.5, 1))
+
+prag_bottom_row <- plot_grid(
+  prag_int_1,
+  prag_int_2,
+  prag_int_3,
+  ncol = 3,
+  labels = c("H", "I", "J"), 
+  label_fontface = "bold",
+  align = "h",
+  rel_widths = c(1, 0.75, 0.85))
+
+prag_combined <- plot_grid(
+  prag_top_row,
+  prag_bottom_row,
+  ncol = 1,
+  rel_heights = c(1, 1))
+
+ggsave("../outputs/prag_shap_combined.png", plot = prag_combined, width = 18, height = 12, dpi = 600, scale = 0.8)
+```
+
+```{r generate-one-shap-plot}
+orev_row <- plot_grid(
+  orev_absolute_shap_plot,
+  orev_age_flat_plot,
+  orev_int_1,
+  orev_int_2,
+  orev_int_3,
+  ncol = 5, 
+  align = "h",
+  labels = c("A", "B", "C", "D", "E"), 
+  label_fontface = "bold",
+  rel_widths = c(1.2, 1, 0.95, 0.8, 0.9))
+
+prag_row <- plot_grid(
+  prag_absolute_shap_plot,
+  prag_age_flat_plot,
+  prag_int_1,
+  prag_int_2,
+  prag_int_3,
+  ncol = 5, 
+  labels = c("F", "G", "H", "I", "J"), 
+  label_fontface = "bold",
+  rel_widths = c(1.2, 1, 0.95, 0.8, 0.9))
+
+
+shap_combined <- plot_grid(
+  orev_row,
+  prag_row,
+  ncol = 1)
+
+ggsave("../outputs/combined_shap_plot.png", plot = shap_combined, width = 24, height = 14, dpi = 600, scale = 0.8)
+```
+

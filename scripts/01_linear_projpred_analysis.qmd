@@ -1,0 +1,519 @@
+---
+—---
+title: "Link between Experiences and Cognition"
+format: html
+editor: visual
+---
+
+```{r libraries}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+
+library(xgboost)
+library(vip)
+library(glmnet)
+library(dplyr)
+library(projpred)
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(brms)
+library(posterior)
+library(bayesplot)
+library(doRNG)
+library(ggplotify)
+library(ggfortify)
+library(png)
+library(grid)
+library(latex2exp)
+library(corrplot)
+library(ggpubr)
+library(broom)
+library(cowplot)
+library(grid)
+library(gridExtra)
+```
+
+```{r load_data}
+final_df <- read_csv("../data/final_feature_df.csv")
+
+predictors <- c(
+  "kcs_per_overall", "kcs_per_Interacting", "kcs_per_Not_Interacting",
+  "total_speech_exposure_per_overall", "total_speech_exposure_per_Interacting", "total_speech_exposure_per_Not_Interacting",
+  "kcds_exposure_per_overall", "kcds_exposure_per_Interacting", "kcds_exposure_per_Not_Interacting",
+  "ohs_exposure_per_overall", "ohs_exposure_per_Interacting", "ohs_exposure_per_Not_Interacting",
+  "turns_per_minute_overall",
+  "turns_per_minute_interacting",
+  "agency_initiation_prop",
+  "avg_turn_duration",
+  "avg_block_duration",
+  "avg_turns_per_block",
+  "pct_face_visible", "pct_person_visible", "pct_face_or_person_visible", "avg_face_proximity",
+  "pct_Interacting"
+)
+
+predictors <- c(
+  "turns_per_minute_interacting", "agency_initiation_prop", "avg_turn_duration",
+  "pct_face_or_person_visible",
+  "pct_Not_Interacting",
+  "ohs_exposure_per_Interacting",
+  "kcs_per_overall", "kcs_per_Interacting",
+  "kcds_exposure_per_Interacting", "kcds_exposure_per_Not_Interacting",
+  "total_speech_exposure_per_Not_Interacting", "total_speech_exposure_per_Interacting"
+)
+```
+
+```{r postponed_projpred_orev}
+# 1. Prepare Data
+formula_string_orev <- paste("orev_successes | trials(orev_trials) ~", paste(predictors, collapse = " + "), "+ age_at_test")
+final_orev_formula <- as.formula(formula_string_orev)
+
+# 2. Define the search path
+s_terms <- c("1",
+             predictors, 
+             paste0(paste(predictors, collapse = " + "), " + age_at_test"))
+
+# Rescale data
+proj_orev_full_data <- final_df %>% 
+  select(orev_successes, orev_trials, age_at_test, child_id, all_of(predictors)) %>%
+  drop_na() %>%
+  mutate(across(c(age_at_test, all_of(predictors)), as.numeric)) %>%
+  mutate(across(c(age_at_test, all_of(predictors)), scale))
+
+proj_orev_full_data$child_id <- as.factor(proj_orev_full_data$child_id)
+
+# 2. Fit Reference Model
+ref_orev_model <- brm(
+  formula = final_orev_formula,
+  data = proj_orev_full_data,
+  family = binomial(link = "logit"), 
+  chains = 4, 
+  iter = 4000, 
+  warmup = 1000, 
+  cores = 4, 
+  seed = 123,
+  refresh = 50,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "rstan",
+  threads = threading(8),
+)
+
+# 3. Create Reference Object
+ref_orev_obj <- get_refmodel(ref_orev_model)
+
+# 2. Run final model
+cvvs_orev_final <- cv_varsel(
+  ref_orev_obj,
+  method = 'forward',
+  cv_method = 'loo',
+  search_terms = s_terms,
+  #nterms_max = length(s_terms),
+  validate_search = TRUE,
+  parallel = TRUE,
+  threads = threading(8),
+)
+
+summary(cvvs_orev_final)
+p_orev <- plot(cvvs_orev_final, stats = "mlpd", deltas = TRUE)
+
+rk_orev <- ranking(cvvs_orev_final)
+pr_rk_orev <- cv_proportions(rk_orev)
+plot(pr_rk_orev)
+```
+
+```{r projpred_inference_orev}
+# --- STEP D: POST-SELECTION INFERENCE ---
+size_decided_orev <- 13
+predictors_final_orev <- head(rk_orev[["fulldata"]], size_decided_orev) 
+  
+# 1. Project the reference model onto your chosen variables
+prj_orev <- project(ref_orev_obj, 
+                   predictor_terms = predictors_final_orev, 
+                   ndraws = 4000)
+
+# 2. Convert to a matrix so we can see the coefficients (Betas)
+prj_mat_orev <- as.matrix(prj_orev)
+
+# Convert to correct format for "posterior"
+prj_drws_orev <- as_draws_matrix(prj_mat_orev)
+# Calculate stats: Median, MAD (Standard Deviation equivalent), and 95% Intervals
+prj_smmry_orev <- summarize_draws(
+  prj_drws_orev,
+  "median", "mad", function(x) quantile(x, probs = c(0.025, 0.975))
+  )
+prj_smmry_orev <- as.data.frame(prj_smmry_orev)
+print(prj_smmry_orev, digits = 1)
+# save summary table
+write.csv(prj_smmry_orev, "../outputs/prj_summary_orev.csv", row.names = TRUE)
+
+# 3. Visualize the "Effect Size" for your top 4 variables
+bayesplot_theme_set(ggplot2::theme_bw())
+# Creates the visual "Forest Plot"
+# If a variable's bar does not cross zero, it is a "significant" predictor.
+# If it is to the right of zero, it increases OREV score.
+# If it is to the left, it decreases it.
+mcmc_intervals(prj_mat_orev) + 
+  ggplot2::coord_cartesian(xlim = c(-1.5, 1.6))
+
+refm_mat_orev <- as.matrix(ref_orev_model)
+mcmc_intervals(refm_mat_orev, pars = colnames(prj_mat_orev)) +
+  ggplot2::coord_cartesian(xlim = c(-1.5, 1.6))
+```
+
+```{r projpred_predictions_orev}
+# 1. Generate simulated data
+prj_predict_orev <- proj_predict(prj_orev)
+
+# 2. Run the visual check
+# Use ppc_bars for count data (integers 0-20)
+ppc_bars(
+  y = proj_orev_full_data$orev_successes,
+  yrep = prj_predict_orev
+) + 
+  ggtitle("Orev Binomial Model Check: Real vs. Simulated Correct Items") +
+  xlab("Number of Correct Items (out of 20)")
+```
+
+```{r postponed_projpred_prag}
+# 1. Prepare Data
+formula_string_prag <- paste("prag_successes | trials(prag_trials) ~", paste(predictors, collapse = " + "), "+ age_at_test")
+final_prag_formula <- as.formula(formula_string_prag)
+
+# Rescale data
+proj_prag_full_data <- final_df %>% 
+  select(prag_successes, prag_trials, age_at_test, child_id, all_of(predictors)) %>%
+  drop_na() %>%
+  mutate(across(c(age_at_test, all_of(predictors)), as.numeric)) %>%
+  mutate(across(c(age_at_test, all_of(predictors)), scale))
+
+proj_prag_full_data$child_id <- as.factor(proj_prag_full_data$child_id)
+
+# 2. Fit Reference Model
+ref_prag_model <- brm(
+  formula = final_prag_formula,
+  data = proj_prag_full_data,
+  family = binomial(link = "logit"), 
+  #prior = set_prior(horseshoe(df = 1, par_ratio = par_ratio_orev)),
+  chains = 4, 
+  iter = 4000, 
+  warmup = 1000, 
+  cores = 4, 
+  seed = 123,
+  refresh = 50,
+  control = list(adapt_delta = 0.99, max_treedepth = 15),
+  backend = "rstan",
+  threads = threading(8),
+)
+
+# 3. Create Reference Object
+ref_prag_obj <- get_refmodel(ref_prag_model)
+
+# 2. Run final model
+cvvs_prag_final <- cv_varsel(
+  ref_prag_obj,
+  method = 'forward',
+  cv_method = 'loo',
+  search_terms = s_terms,
+  validate_search = TRUE,
+  parallel = TRUE,
+  threads = threading(8),
+)
+
+summary(cvvs_prag_final)
+p_prag <- plot(cvvs_prag_final, stats = "mlpd", deltas = TRUE)
+
+rk_prag <- ranking(cvvs_prag_final)
+pr_rk_prag <- cv_proportions(rk_prag)
+plot(pr_rk_prag)
+
+ggsave("../outputs/rk_prag.png", plot(pr_rk_prag), width = 20, height = 14, dpi = 300, scale= 0.5)
+
+```
+
+```{r projpred_inference_prag}
+# --- STEP D: POST-SELECTION INFERENCE ---
+size_decided_prag <- 13
+predictors_final_prag <- head(rk_prag[["fulldata"]], size_decided_prag) 
+  
+# 1. Project the reference model onto your chosen variables
+prj_prag <- project(ref_prag_obj, 
+                   predictor_terms = predictors_final_prag, 
+                   ndraws = 4000)
+
+# 2. Convert to a matrix so we can see the coefficients (Betas)
+prj_mat_prag <- as.matrix(prj_prag )
+
+# Convert to correct format for "posterior"
+prj_drws_prag  <- as_draws_matrix(prj_mat_prag)
+# Calculate stats: Median, MAD (Standard Deviation equivalent), and 95% Intervals
+prj_smmry_prag  <- summarize_draws(
+  prj_drws_prag ,
+  "median", "mad", function(x) quantile(x, probs = c(0.025, 0.975))
+  )
+prj_smmry_prag <- as.data.frame(prj_smmry_prag)
+print(prj_smmry_prag, digits = 1)
+# save summary table
+write.csv(prj_smmry_prag, "../outputs/prj_summary_prag.csv", row.names = TRUE)
+
+# 3. Visualize the "Effect Size" for your top 4 variables
+bayesplot_theme_set(ggplot2::theme_bw())
+# Creates the visual "Forest Plot"
+# If a variable's bar does not cross zero, it is a "significant" predictor.
+# If it is to the right of zero, it increases OREV score.
+# If it is to the left, it decreases it.
+mcmc_intervals(prj_mat_prag) + 
+  ggplot2::coord_cartesian(xlim = c(-1.5, 1.6))
+
+refm_mat_prag <- as.matrix(ref_prag_model)
+mcmc_intervals(refm_mat_prag, pars = colnames(prj_mat_prag)) +
+  ggplot2::coord_cartesian(xlim = c(-1.5, 1.6))
+```
+
+```{r projpred_inference_prag}
+# --- STEP D: POST-SELECTION INFERENCE ---
+
+# 1. Project the reference model onto your 4 chosen variables
+prj_prag <- project(ref_prag_obj, 
+                   predictor_terms = predictors_final_prag, 
+                   ndraws = 4000)
+
+# 2. Convert to a matrix so we can see the coefficients (Betas)
+prj_mat_prag <- as.matrix(prj_prag)
+
+# Convert to correct format for "posterior"
+prj_drws_prag <- as_draws_matrix(prj_mat_prag)
+# Calculate stats: Median, MAD (Standard Deviation equivalent), and 95% Intervals
+prj_smmry_prag <- summarize_draws(
+  prj_drws_prag,
+  "median", "mad", function(x) quantile(x, probs = c(0.025, 0.975))
+  )
+prj_smmry_prag <- as.data.frame(prj_smmry_prag)
+print(prj_smmry_prag, digits = 1)
+# save summary table
+write.csv(prj_smmry_prag, "../outputs/prj_summary_prag.csv", row.names = TRUE)
+
+# 3. Visualize the "Effect Size" for your top variables
+bayesplot_theme_set(ggplot2::theme_bw())
+# Creates the visual "Forest Plot"
+# If a variable's bar does not cross zero, it is a "significant" predictor.
+# If it is to the right of zero, it increases OREV score.
+# If it is to the left, it decreases it.
+mcmc_intervals(prj_mat_prag) + 
+  ggplot2::coord_cartesian(xlim = c(-1.5, 1.6))
+
+refm_mat_prag <- as.matrix(ref_prag_model)
+mcmc_intervals(refm_mat_prag, pars = colnames(prj_mat_prag)) +
+  ggplot2::coord_cartesian(xlim = c(-1.5, 1.6))
+```
+
+```{r projpred_predictions_prag}
+# 1. Generate simulated data
+prj_predict_prag <- proj_predict(prj_prag)
+
+# 2. Run visual check
+# Use ppc_bars for count data (integers 0-20)
+ppc_bars(
+  y = proj_prag_full_data$prag_successes,
+  yrep = prj_predict_prag
+) + 
+  ggtitle("Prag Binomial Model Check: Real vs. Simulated Correct Items") +
+  xlab("Number of Correct Items (out of 20)")
+```
+
+```{r create_combined_plot}
+label_dict <- list(
+  # Demographics
+  "age_at_test" = "age",
+
+  # Global Ecology
+  "pct_Interacting"     = "P[int]",
+  "pct_Not_Interacting" = "P[paste('\u00AC', int)]",
+
+  # Vocal Activity
+  "kcs_per_overall"         = "KCS[all]",
+  "kcs_per_Interacting"     = "KCS[int]",
+  "kcs_per_Not_Interacting" = "KCS[paste('\u00AC',int)]",
+
+  # Speech Exposure (total)
+  "total_speech_exposure_per_overall"         = "Exps[all]",
+  "total_speech_exposure_per_Interacting"     = "Exps[int]",
+  "total_speech_exposure_per_Not_Interacting" = "Exps[paste('\u00AC', int)]",
+
+  # Child-directed speech
+  "kcds_exposure_per_overall"         = "KCDS[all]",
+  "kcds_exposure_per_Interacting"     = "KCDS[int]",
+  "kcds_exposure_per_Not_Interacting" = "KCDS[paste('\u00AC', int)]",
+
+  # Overheard speech
+  "ohs_exposure_per_overall"         = "OHS[all]",
+  "ohs_exposure_per_Interacting"     = "OHS[int]",
+  "ohs_exposure_per_Not_Interacting" = "OHS[paste('\u00AC', int)]",
+
+  # Turn-Taking
+  "turns_per_minute_overall"     = "TpM[all]",
+  "turns_per_minute_interacting" = "TpM[int]",
+  "agency_initiation_prop"       = "P[agency]",
+  "avg_turn_duration"            = "bar(D)[turn]",
+  "avg_block_duration"           = "bar(D)[block]",
+  # FIX: Using valid plotmath formatting for slash/fractions
+  "avg_turns_per_block"          = "bar(N)[plain('turn/block')]",
+
+  # Visuals
+  "pct_face_visible"           = "P[face]",
+  "pct_person_visible"         = "P[person]",
+  # FIX: Using plain text grouping for combinations
+  "pct_face_or_person_visible" = "P[plain('face/person')]",
+  "avg_face_proximity"         = "bar(d)[face]"
+)
+
+paper_labels <- function(axis_breaks) {
+  if (is.numeric(axis_breaks)) {
+    indices <- as.integer(axis_breaks) + 1  
+    raw_names <- existing_order_3[indices]
+  } else {
+    raw_names <- axis_breaks
+  }
+  
+  new_labels <- sapply(raw_names, function(name) {
+    if (is.na(name) || name == "") {
+      return("''") # Return an explicit empty plotmath string literal
+    } else if (name %in% names(label_dict)) {
+      return(label_dict[[name]])
+    } else {
+      # Wrap completely in escaped quotes so parse never breaks on plain words
+      return(paste0("plain('", name, "')"))
+    }
+  })
+  
+  # Crucial Fix: Vectorize the parsing safely so it retains full length
+  return(as.expression(lapply(new_labels, function(x) parse(text = x)[[1]])))
+}
+
+p3 <- plot(cvvs_orev_final, stats = "mlpd", deltas = TRUE)
+p4 <- plot(cvvs_prag_final, stats = "mlpd", deltas = TRUE)
+
+
+# 2. Extract the existing order of the y-axis (Predictors)
+existing_order_3 <- ggplot_build(p3)$layout$panel_params[[1]]$x$get_labels()
+existing_order_4 <- ggplot_build(p4)$layout$panel_params[[1]]$x$get_labels()
+
+title_style <- theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14))
+
+master_theme <- theme_bw(base_size = 24) + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 40), # Very large titles
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 20),
+    axis.text.y = element_text(size = 20),
+    #strip.background = element_blank(),
+    #strip.text = element_blank(),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20)
+  )
+
+# 3. Apply your labels AND the limits to keep the order
+increase_matrix_text <- function(p, new_size = 6) {
+  p$layers[[which(sapply(p$layers, function(x) inherits(x$geom, "GeomText")))]]$aes_params$size <- new_size
+  return(p)
+}
+
+p_orev_mlpd <- p3 + 
+  master_theme +
+  labs(title = NULL, subtitle = NULL) +
+  labs(title = NULL, subtitle = NULL, y = "Dif vs. \nref model") +
+  theme(axis.title.x = element_blank(), strip.text = element_blank(), strip.background = element_blank()) +
+  scale_x_continuous(breaks = 0:(length(existing_order_3)-1), labels = paper_labels(existing_order_3))
+
+p_prag_mlpd <- p4 + 
+  master_theme +
+  labs(title = NULL, subtitle = NULL, y = "Dif vs. \nref model") +
+  theme(axis.title.x = element_text(size = 20, margin = margin(t = 10)), strip.text = element_blank(), strip.background = element_blank()) +
+  scale_x_continuous(name = "Submodel Size (Predictors added sequentially)", breaks = 0:(length(existing_order_4)-1), labels = paper_labels(existing_order_4))
+
+# 3. Combine them vertically
+combined_mlpd_plot_stacked <- plot_grid(
+  p_orev_mlpd, 
+  p_prag_mlpd,
+  rel_heights = c(0.9, 1),
+  align = "v",                          
+  labels = c("C", "D"),
+  label_fontface = "bold",
+  ncol = 1
+)
+
+saveRDS(combined_mlpd_plot_stacked, "../outputs/mlpd_combined_plot_stacked.rds")
+saveRDS(p_orev_mlpd, "../outputs/orev_mlpd.rds")
+saveRDS(p_prag_mlpd, "../outputs/prag_mlpd.rds")
+
+ggsave("../outputs/mlpd_combined_plot_stacked.png", combined_mlpd_plot_stacked, width = 12, height = 10, dpi = 800) #scale= 0.85)
+ggsave("../outputs/mlpd_combined_plot_stacked.png", combined_mlpd_plot_stacked, width = 12, height = 10, dpi = 800) #scale= 0.85)
+ggsave("../outputs/mlpd_combined_plot_stacked.png", combined_mlpd_plot_stacked, width = 12, height = 10, dpi = 800) #scale= 0.85)
+```
+
+```{r mlpd_and_ranking_plots_side_by_side}
+# Individual plots
+
+p_orev_ranking_plot <- p1 + 
+  master_theme +
+  scale_y_discrete(limits = existing_order_1, labels = paper_labels) +
+  title_style
+
+p_prag_ranking_plot <- p2 + 
+  master_theme +
+  scale_y_discrete(limits = existing_order_2, labels = paper_labels) +
+  title_style
+
+shared_ylim <- c(-0.375, 0.0)
+
+p_orev_mlpd_plot <- p_orev + 
+  master_theme +              
+  labs(title = NULL, subtitle = NULL, y = "Dif vs. ref model", x = NULL) +
+  scale_x_continuous(
+    breaks = 0:(length(existing_order_3) - 1), 
+    labels = paper_labels(existing_order_3)
+  ) + 
+  coord_cartesian(ylim = shared_ylim) + 
+  theme(                             
+    plot.margin = margin(b = 10, r = 0) # Added bottom margin
+  )
+
+p_prag_mlpd_plot <- p_prag + 
+  master_theme +            
+  labs(title = NULL, subtitle = NULL, y = NULL, x = NULL) + 
+  scale_x_continuous(
+    breaks = 0:(length(existing_order_4) - 1), 
+    labels = paper_labels(existing_order_4)
+  ) +
+  coord_cartesian(ylim = shared_ylim) + 
+  theme(                            
+    axis.text.y  = element_blank(),     
+    axis.ticks.y = element_blank(),     
+    plot.margin  = margin(b = 10, l = 0) # Added bottom margin
+  )
+
+mlpd_plots_raw <- plot_grid(
+  p_orev_mlpd_plot + theme(plot.margin = margin(r = 15, l = 5)), # 1. Added a slight right padding to oREV
+  p_prag_mlpd_plot,
+  nrow = 1,
+  align = "h",                          
+  rel_widths = c(1, 0.9),                                
+  labels = c("A", "B"), 
+  label_fontface = "bold",
+  label_x = c(0.01, -0.015),  # Pulls 'B' out into the empty whitespace on the left
+  hjust = 0                 # Keeps them neatly left-aligned at their new coordinates
+)
+
+clean_x_label <- textGrob(
+  "Submodel Size (Predictors added sequentially by forward-ranking order)", 
+  gp = gpar(fontsize = 24)
+)
+
+# Arrange the grid with the new bottom label
+mlpd_plots <- grid.arrange(mlpd_plots_raw, bottom = clean_x_label)
+
+
+ggsave("../outputs/predictor_ranking_orev.png", p_orev_ranking_plot, width = 20, height = 14, dpi = 300, scale= 0.5)
+ggsave("../outputs/predictor_ranking_prag.png", p_prag_ranking_plot, width = 20, height = 14, dpi = 300, scale= 0.5)
+
+ggsave("../outputs/mlpd_combined_plot_side_by_side.png", mlpd_plots, width = 20, height = 8, dpi = 600, scale = 0.80)
+dggsave("../outputs/mlpd_orev.png", p_orev_mlpd_plot, width = 16, height = 8, dpi = 300, scale= 0.80)
+ggsave("../outputs/mlpd_prag.png", p_prag_mlpd_plot, width = 16, height = 8, dpi = 300, scale= 0.80)
+```

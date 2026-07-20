@@ -1,0 +1,577 @@
+---
+title: "Link between Experiences and Cognition"
+format: html
+editor: visual
+---
+
+```{r}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+
+library(tidyverse)
+library(ggthemes)
+library(jsonlite)
+library(readxl)
+library(tidyboot)
+library(ggpubr)
+library(ggcorrplot)
+library(reshape2)
+library(dplyr)
+```
+
+```{r load_data}
+cognitive_data <- read_csv("../data/cognitive_data.csv")
+kcs_rel_data <- read_csv("../data/02_kcs_summary.csv")
+kcs_abs_data <- read_csv("../data/02a_global_kcs_summary.csv") |>
+  rename(kcs_per_overall = speech_activity_percent)
+
+exposure_rel_data <- read_csv("../data/03_cds_summary.csv")
+exposure_abs_data <- read_csv("../data/03a_global_cds_summary.csv")
+
+turn_rel_data <- read_csv("../data/04_turn_taking_summary.csv")
+turn_abs_data <- read_csv("../data/04a_global_turn_taking_summary.csv") |>
+  rename(turns_per_minute_overall = turns_per_minute)
+
+turn_durations_data <- read_csv("../data/04b_turn_durations_summary.csv")
+
+#frame_composition_data <- read_csv("../data/05_interaction_composition.csv")
+frame_composition_data <- read_csv("../data/05_interaction_composition.csv") %>%
+  mutate(
+    person_or_face_present = if_else(has_face == 1 | has_person == 1, 1, 0)
+  )
+
+social_state_data <- read_csv("../data/01_interaction_segments.csv")
+```
+
+```{r data_cleaning}
+# define affected child IDs
+dup_ids <- c(262726, 267567)
+
+# identify rows for those children in the prag task
+subset_rows <- cognitive_data$child_id %in% dup_ids & cognitive_data$task == "prag"
+
+# remove duplicates only inside that subset
+subset_unique <- unique(cognitive_data[subset_rows, ])
+
+# combine with the untouched rest of the data
+cognitive_data_clean <- rbind(
+  cognitive_data[!subset_rows, ],
+  subset_unique
+)
+
+# check result
+subset(cognitive_data_clean, child_id %in% dup_ids & task == "prag")
+
+# store clean cognitive data without duplicates 
+write.csv(cognitive_data_clean, "../data/cognitive_data_clean.csv", row.names = FALSE)
+```
+
+```{r correlation_between_age_dependent_variables}
+cognitive_data_clean%>%
+  group_by(child_id, task, age)%>%
+  summarise(perf = mean(abs(response)))%>%
+  filter(!is.na(task))%>%
+  ggplot(aes(x = age, y = perf))+
+  geom_point(pch = 1)+
+  geom_smooth(method = "glm")+
+  facet_wrap(~task, scales = "free")+
+  #ylim(0,1)+
+  labs(x = "Age in years", y = "Performance")+
+  theme_bw()
+```
+
+```{r generate_distributions_plot}
+# 1. Calculate the percentage of successful trials (where response == 1) per child per task
+cognitive_data_aggregated <- cognitive_data_clean %>%
+  filter(task %in% c("orev", "prag")) %>%
+  group_by(child_id, task) %>%
+  summarize(
+    # Count how many trials equal 1, divide by total trials, and multiply by 100
+    score = (sum(response == 1, na.rm = TRUE) / n()) * 100, 
+    .groups = "drop"
+  )
+
+distribution_plot <- ggplot(cognitive_data_aggregated, aes(x = score, fill = task, color = task)) +
+  # 1. Separated density layers with hardcoded light colors
+  geom_density(data = filter(cognitive_data_aggregated, task == "orev"), 
+               aes(y = after_stat(density) * 35), fill = "#DCDD5B", alpha = 0.5, color = NA) + 
+  geom_density(data = filter(cognitive_data_aggregated, task == "prag"), 
+               aes(y = after_stat(density) * 35), fill = "#C9D2D5", alpha = 0.5, color = NA) +
+  
+  # 2. Side-by-side independent dot columns 
+  geom_dotplot(aes(group = task), 
+               method = "histodot",
+               binwidth = 2.5,          
+               stackratio = 1.1,        
+               dotsize = 0.55,           
+               stackgroups = FALSE,      
+               binpositions = "bygroup", 
+               position = position_dodge(width = 2), 
+               alpha = 1,               
+               show.legend = TRUE) + # Keeps the single core legend alive
+  
+  # 3. Scale fill handles the core solid dot colors and the primary legend keys
+  scale_fill_manual(values = c("orev" = "#B5B577", "prag" = "#98A3A6"), 
+                    labels = c("orev" = "oREV", "prag" = "PRAG")) +
+                    
+  # 4. CRITICAL FIX: Forces color to use identical mapping but explicitly kills its duplicate legend
+  scale_color_manual(values = c("orev" = "#B5B577", "prag" = "#98A3A6"), guide = "none") + 
+  
+  # Clean bypass override to keep the key markers perfectly solid
+  guides(fill = guide_legend(
+    override.aes = list(
+      alpha = 1,
+      color = NA,  # Removes the black outline circle around the legend keys
+      size = 10     # Increases the key size so they look prominently bigger
+    )
+  )) +
+  
+  xlim(0, 100) + 
+  labs(
+    title = NULL,
+    x = "Success Rate (%)",
+    fill = "Domain"  # Naming this 'Domain' unifies any loose aesthetics seamlessly
+  ) +
+  theme_minimal(base_size = 24) +
+  theme(
+    legend.position = "inside",             
+    legend.position.inside = c(0.15, 0.78),
+    legend.background = element_rect(fill = "white", color = NA), 
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_blank(), 
+    axis.title.y = element_blank(),
+    # --- UPDATED LAYOUT ADJUSTMENTS FOR MAXIMUM COMPACTNESS ---
+    legend.title = element_text(margin = margin(b = 1)),        
+    legend.key.height = unit(0.05, "cm"),                           
+    legend.margin = margin(t = 2, r = 5, b = 2, l = 5, unit = "pt") 
+  )
+
+distribution_plot
+```
+
+```{r generate_correlation_plot}
+# --- PANEL B: DOMAIN CORRELATION ---
+
+# 2. Pivot to a wide format for the correlation and scatter plot steps
+wide_cognitive_data <- cognitive_data_aggregated %>%
+  pivot_wider(names_from = task, values_from = score) %>%
+  drop_na(orev, prag) 
+
+# 3. Calculate statistical correlation
+domain_correlation <- cor.test(wide_cognitive_data$orev, wide_cognitive_data$prag, method = "pearson")
+
+r_val <- round(domain_correlation$estimate, 2)
+p_val <- round(domain_correlation$p.value, 4)
+
+correlation_plot <- ggplot(wide_cognitive_data, aes(x = orev, y = prag)) +
+  geom_point(color = "#BEA468", alpha = 1, size = 2.9) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "#927B2D", fill = "#E0D2B6", se = TRUE) +
+  xlim(0, 100) + # Enforces percentage bounds
+  ylim(0, 100) +
+  annotate("label", 
+           x = 2, 
+           y = 97.5, 
+           label = paste0("r = ", r_val, "\np ", ifelse(p_val < 0.001, "< .001", paste0("= ", p_val))),
+           fontface = "italic", 
+           size = 24 / 2.845, 
+           hjust = 0,
+           vjust = 1,               # Anchors the text box neatly from the top-left corner
+           fill = "white",            # Makes the background solid white
+           label.size = 0) +
+  labs(
+    title = NULL,
+    x = "oREV Success Rate (%)",
+    y = "PRAG Success Rate (%)",
+  ) +
+  theme_minimal(base_size = 24) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0)
+  )
+```
+
+```{r grenerate_combined_plot}
+combined_plot <- plot_grid(
+  distribution_plot,
+  correlation_plot,
+  nrow = 1,
+  align = "h",                          
+  rel_widths = c(1, 0.9),                                
+  labels = c("A", "B"), 
+  label_fontface = "bold",
+  label_x = c(0.01, -0.015),  # Pulls 'B' out into the empty whitespace on the left
+  hjust = 0                 # Keeps them neatly left-aligned at their new coordinates
+)
+
+ggsave("../outputs/domain_descriptive_plots.png", combined_plot, width = 20, height = 6, dpi = 600, scale = 0.80)
+```
+
+```{r correlation_between_cognitive_tests}
+cognitive_data_clean%>%
+  group_by(child_id, task)%>%
+  summarise(perf = mean(abs(response)))%>%
+  filter(!is.na(task))%>%
+  left_join(cognitive_data_clean %>%
+              rename("task2"= task)%>%
+              filter(!is.na(task2))%>%
+              group_by(child_id, task2)%>%
+              summarise(perf2 = mean(abs(response))))%>%
+  filter(task != task2)%>%
+  rowwise()%>%
+  mutate(tid = paste(sort(c(task, task2)), collapse = " - "))%>%
+  ungroup()%>%
+  distinct(child_id,tid, .keep_all = T)%>%
+  ggplot(aes(x = perf, y = perf2))+
+  #geom_abline(intercept = 0, slope = 1, lty = 3, alpha = .75)+
+  geom_smooth(method = "lm")+
+  geom_point(pch = 1)+
+  facet_wrap(task ~ task2, scales = "free")+
+  stat_cor()+
+  theme_few()
+```
+
+```{r prepare_cognitive_data}
+# Aggregate Cognitive Data
+cog_summary <- cognitive_data_clean %>%
+  group_by(child_id, sex, task) %>% 
+  summarise(
+    age_at_test = min(as.numeric(age), na.rm = TRUE),
+    
+    # Logic for Count-based tasks (OREV, PRAG)
+    successes = if(first(task) %in% c("orev", "prag")) {
+                  sum(abs(as.numeric(response)), na.rm = TRUE) 
+                } else { NA },
+    
+    trials = n(),
+    
+    # Logic for Distance-based tasks (TANGO)
+    avg_error = if(first(task) == "tango") {
+                  mean(abs(as.numeric(response)), na.rm = TRUE) 
+                } else { NA },
+    
+    .groups = "drop"
+  ) %>%
+  # Pivot wider to get one column per task-metric pair
+  pivot_wider(
+    id_cols = c(child_id, age_at_test, sex),
+    names_from = task,
+    values_from = c(successes, trials, avg_error),
+    names_glue = "{task}_{.value}"
+  ) %>%
+  # Clean up the column names to be more intuitive
+  rename(
+    tango_error = tango_avg_error
+  ) %>%
+  # Remove columns that are entirely NA (like orev_avg_error or tango_successes)
+  select(where(~ !all(is.na(.))))
+```
+
+```{r prepare_kcs_data}
+# --- Step 2: Weighted Aggregation with Global Min Age ---
+kcs_rel_wide <- kcs_rel_data %>%
+  # 1. First, create a global minimum age for each child across ALL states
+  group_by(child_id) %>%
+  mutate(age_at_recording = min(age_at_recording, na.rm = TRUE)) %>%
+  
+  # 2. Group by child, that global age, and state to aggregate speech
+  group_by(child_id, age_at_recording, interaction_type) %>%
+  summarize(
+    total_segment_minutes = sum(segment_duration_minutes, na.rm = TRUE),
+    total_speech_minutes = sum(kchi_speech_minutes, na.rm = TRUE),
+    # Weighted activity percentage
+    total_speech_activity = total_speech_minutes / total_segment_minutes,
+    .groups = "drop"
+  ) %>%
+  
+  # 3. Pivot to wide format
+  select(child_id, age_at_recording, interaction_type, total_speech_activity) %>%
+  pivot_wider(
+    names_from = interaction_type, 
+    values_from = total_speech_activity,
+    names_prefix = "kcs_per_" 
+  )
+```
+
+```{r prepare_exposure_data}
+# Define a helper to process the different exposure types
+process_exposure <- function(data, prefix) {
+  data %>%
+    group_by(child_id) %>%
+    mutate(age_at_recording = min(age_at_recording, na.rm = TRUE)) %>%
+    group_by(child_id, age_at_recording, interaction_type) %>%
+    summarize(
+      total_segment_sec = sum(total_segment_duration, na.rm = TRUE),
+      total_speech_sec = sum(total_speech_seconds, na.rm = TRUE),
+      # Ensure units match for the proportion
+      activity_prop = total_speech_sec / total_segment_sec,
+      .groups = "drop"
+    ) %>%
+    select(child_id, age_at_recording, interaction_type, activity_prop) %>%
+    pivot_wider(
+      names_from = interaction_type, 
+      values_from = activity_prop,
+      names_prefix = paste0(prefix, "_per_")
+    )
+}
+
+# 2. Create three tables
+total_exposure_rel_wide <- process_exposure(exposure_rel_data %>% filter(exposure_type == "TOTAL"), "total_speech_exposure")
+kcds_exposure_rel_wide  <- process_exposure(exposure_rel_data %>% filter(exposure_type == "KCDS_ONLY"), "kcds_exposure")
+ohs_exposure_rel_wide   <- process_exposure(exposure_rel_data %>% filter(exposure_type == "OHS_ONLY"), "ohs_exposure")
+
+total_exposure_abs_wide <- exposure_abs_data %>% 
+  filter(exposure_type == "TOTAL") %>% 
+  rename(total_speech_exposure_per_overall = exposure_percent)
+
+kcds_exposure_abs_wide <- exposure_abs_data %>% 
+  filter(exposure_type == "KCDS_ONLY") %>% 
+  rename(kcds_exposure_per_overall = exposure_percent)
+
+ohs_exposure_abs_wide <- exposure_abs_data %>% 
+  filter(exposure_type == "OHS_ONLY") %>% 
+  rename(ohs_exposure_per_overall = exposure_percent)
+```
+
+```{r prepare_turn_data}
+# Process for plotting points: ONE point per child
+turn_rel_wide <- turn_rel_data %>%
+  group_by(child_id) %>%
+  summarize(
+    age_at_recording = min(age_at_recording),
+    total_segment_minutes = sum(segment_duration_minutes),
+    total_turns_sum = sum(total_turns),
+    # Weighted average turns per minute
+    turns_per_minute_interacting = total_turns_sum / total_segment_minutes,
+    .groups = "drop"
+  )
+```
+
+```{r prepare_agency_data}
+# --- Step 2: Calculate Weighted Agency (Initiation only) ---
+turns_agency_wide <- turn_rel_data %>%
+  mutate(
+    total_successful_blocks = successful_initiations + successful_responses
+  ) %>%
+  # 1. Filter out zero-activity segments before aggregating
+  filter(total_successful_blocks > 0) %>%
+  group_by(child_id) %>%
+  summarize(
+    # Keep the global minimum recording age
+    age_at_recording = min(age_at_recording, na.rm = TRUE),
+    # Sum the raw counts to create a weighted ratio
+    total_init = sum(successful_initiations, na.rm = TRUE),
+    total_blocks = sum(total_successful_blocks, na.rm = TRUE),
+    # Calculate the single Agency value
+    agency_initiation_prop = total_init / total_blocks,
+    .groups = "drop"
+  ) %>%
+  # 3. Select only the ID and the new metric for the join
+  select(child_id, agency_initiation_prop)
+```
+
+```{r prepare_turn_duration_data}
+turn_durations_wide <- turn_durations_data %>%
+  group_by(child_id) %>%
+  summarize(
+    # Get the raw age for the x-axis
+    age_at_recording = min(as.numeric(age_at_recording), na.rm = TRUE),
+    # Calculate the average duration for this child
+    avg_turn_duration = mean(vocalization_duration_sec, na.rm = TRUE),
+    total_vocalizations = n(),
+    .groups = "drop"
+  )
+```
+
+```{r prepare_block_duration_data}
+block_durations_wide <- turn_rel_data %>%
+  group_by(child_id) %>%
+  summarize(
+    # Get the raw age for the x-axis
+    age_at_recording = min(as.numeric(age_at_recording), na.rm = TRUE),
+    # Calculate the average duration for this child
+    avg_block_duration = mean(block_duration_sec, na.rm = TRUE),
+    # Total blocks analyzed for weighting in future models
+    total_blocks_count = n(),
+    .groups = "drop"
+  )
+```
+
+```{r prepare_turns_per_block}
+turns_per_block <- turn_rel_data %>%
+  group_by(child_id) %>%
+  summarise(
+    # Total turns in all successful blocks / Total number of successful blocks
+    avg_turns_per_block = sum(total_turns) / sum(successful_initiations + successful_responses),
+    .groups = "drop"
+  )
+```
+
+```{r prepare_frame_level_data}
+frame_composition_summary <- frame_composition_data %>%
+  group_by(child_id) %>%
+  summarize(
+    # Visual Environment (%)
+    pct_face_visible = mean(has_face, na.rm = TRUE),
+    pct_person_visible = mean(has_person, na.rm = TRUE),
+    pct_face_or_person_visible = mean(person_or_face_present, na.rm = TRUE),
+    
+    # Physical Proximity (Average Score)
+    avg_face_proximity = mean(proximity_filled[proximity_filled != -1], na.rm = TRUE),
+    age_at_recording = min(age_at_recording, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r prepare_social_state_data}
+# Process for plotting points: One value per child per social state
+social_state_wide <- social_state_data %>%
+  group_by(child_id) %>%
+  mutate(
+    child_total_sec = sum(duration_sec, na.rm = TRUE),
+    min_age_rec = min(age_at_recording, na.rm = TRUE)
+  ) %>%
+  
+  # 2. Group by child, their global min age, and state
+  group_by(child_id, min_age_rec, interaction_type) %>%
+  summarise(
+    prop = sum(duration_sec) / max(child_total_sec),
+    .groups = "drop"
+  ) %>%
+  
+  # 3. Pivot to wide format
+  pivot_wider(
+    names_from = interaction_type, 
+    values_from = prop,
+    names_prefix = "pct_"
+  )
+```
+
+```{r combine_data}
+# --- STEP 3: Combine Everything ---
+behavior_iv_df <- kcs_abs_data %>% 
+              select(child_id, kcs_per_overall) %>%
+  
+  left_join(kcs_rel_wide %>% 
+              select(child_id, age_at_recording, starts_with("kcs_per_")), by = "child_id"
+            ) %>%
+  
+  left_join(total_exposure_abs_wide %>% 
+              select(child_id, total_speech_exposure_per_overall), by = "child_id"
+            ) %>%
+  
+  left_join(kcds_exposure_abs_wide %>% 
+              select(child_id, kcds_exposure_per_overall), by = "child_id"
+            ) %>%
+  
+  left_join(ohs_exposure_abs_wide %>% 
+              select(child_id, ohs_exposure_per_overall), by = "child_id"
+            ) %>%
+  
+  left_join(total_exposure_rel_wide %>% 
+              select(child_id, starts_with("total_speech_exposure_per_")), 
+              by = "child_id"
+              ) %>%
+  
+  left_join(kcds_exposure_rel_wide %>% 
+              select(child_id, starts_with("kcds_exposure_per_")), by = "child_id"
+            ) %>%
+  
+  left_join(ohs_exposure_rel_wide %>% 
+              select(child_id, starts_with("ohs_exposure_per_")), 
+            by = "child_id"
+            ) %>%
+  
+  left_join(turn_rel_wide %>% 
+              select(child_id, turns_per_minute_interacting), 
+            by = "child_id"
+            ) %>%
+  
+  left_join(turn_abs_data %>% 
+              select(child_id, turns_per_minute_overall), 
+            by = "child_id"
+            ) %>%
+  left_join(turns_agency_wide,
+            by = "child_id"
+            ) %>%
+  left_join(turn_durations_wide %>%
+              select(child_id, avg_turn_duration),
+            by = "child_id"
+            ) %>%
+  left_join(block_durations_wide %>%
+              select(child_id, avg_block_duration),
+            by = "child_id"
+            ) %>%
+  left_join(turns_per_block %>% 
+              select(child_id, avg_turns_per_block),
+            by = "child_id"
+            ) %>%
+  left_join(frame_composition_summary %>%
+              select(child_id, pct_face_visible, pct_person_visible, 
+                     pct_face_or_person_visible, avg_face_proximity),
+            by = "child_id"
+            ) %>%
+  left_join(social_state_wide, by = "child_id")
+  
+
+# Check which children are missing behavioral features
+print(length(unique(cog_summary$child_id)))
+missing_ivs <- anti_join(cog_summary, behavior_iv_df, by = "child_id")
+print(nrow(missing_ivs))
+
+# Combine behavior_iv_df and cog_summary for final df (only keep children that are in both dataset)
+final_df = cog_summary %>% inner_join(behavior_iv_df, by = "child_id")
+colnames(final_df)
+# save final_df
+write_csv(final_df, "../data/final_feature_df.csv")
+```
+
+```{r generate_matrix}
+# 1. Define your Independent Variables
+iv_list <- c(
+  "kcs_per_overall", 
+  "kcs_per_Interacting", "kcs_per_Not_Interacting",
+  "total_speech_exposure_per_overall", "total_speech_exposure_per_Interacting", "total_speech_exposure_per_Not_Interacting",
+  "kcds_exposure_per_overall", "kcds_exposure_per_Interacting", "kcds_exposure_per_Not_Interacting",
+  "ohs_exposure_per_overall", "ohs_exposure_per_Interacting", "ohs_exposure_per_Not_Interacting",
+  "turns_per_minute_overall",
+  "turns_per_minute_interacting",
+  "agency_initiation_prop",
+  "avg_turn_duration",
+  "avg_block_duration",
+  "avg_turns_per_block",
+  "pct_face_visible", "pct_person_visible", "pct_face_or_person_visible", "avg_face_proximity",
+  "pct_Interacting", "pct_Not_Interacting"
+)
+
+# 2. Convert to numeric and THEN run correlation
+iv_cor_matrix <- final_df %>%
+  select(any_of(iv_list)) %>% 
+  # This line fixes the 'x must be numeric' error
+  mutate(across(everything(), ~as.numeric(as.character(.)))) %>%
+  cor(use = "pairwise.complete.obs", method = "pearson")
+
+# 3. Plotting code remains the same
+melted_iv_cor <- melt(iv_cor_matrix)
+
+# Mask the lower triangle and diagonal
+#iv_cor_matrix[lower.tri(iv_cor_matrix, diag = TRUE)] <- NA
+#melted_iv_cor <- melt(iv_cor_matrix, na.rm = TRUE)
+
+ggplot(melted_iv_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  # Shrink the correlation numbers
+  geom_text(aes(label = round(value, 2)), size = 3) + 
+  scale_fill_gradient2(low = "#2166ac", high = "#b2182b", mid = "white", 
+                       limit = c(-1, 1), name = "Pearson\nr") +
+  theme_minimal() +
+  theme(
+    # Shrink and angle the axis labels
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_blank(),
+    panel.grid.major = element_blank()
+  ) +
+  # This forces the tiles to be perfect squares
+  coord_fixed()
+
+ggsave("../outputs/predictor_matrix_large.png", width = 14, height = 12, dpi = 300)
+```
