@@ -35,5 +35,13 @@ Our dual modeling framework captures both linear bounds and non-linear, non-mono
 │   ├── prag_hyperparameter_tuning_log.csv    
 │   └── catboost_performance_metrics.csv
 │
+├── paper/                                    <-- Manuscript source files
+│   ├── Ecology_cognition_link.Rmd            # Main manuscript source
+│   ├── ecology_cognition_link.bib            # Bibliography
+│   ├── apa.csl                               # Citation style
+│   ├── images/                               # Manuscript-specific figures
+│   ├── data/                                 # Local manuscript data snapshots
+│   └── Ecology_cognition_link.docx            # Final compiled manuscript
+│
 ├── requirements.txt                          <-- Python dependencies
 └── README.md                                 <-- Navigation and replication guide
